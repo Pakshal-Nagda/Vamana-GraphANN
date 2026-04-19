@@ -59,6 +59,18 @@ class VamanaIndex {
     // A candidate = (distance, node_id). Ordered by distance.
     using Candidate = std::pair<float, uint32_t>;
 
+    // ---- Scratch Buffer Pool ----
+    struct SearchScratch {
+        std::vector<uint16_t> visited_array;
+        uint16_t visited_gen = 0;
+    };
+
+    mutable std::mutex scratch_lock_;
+    mutable std::vector<SearchScratch*> scratch_pool_;
+
+    SearchScratch* get_scratch() const;
+    void release_scratch(SearchScratch* scratch) const;
+
     // ---- Core algorithms ----
 
     // Greedy search starting from start_node_.

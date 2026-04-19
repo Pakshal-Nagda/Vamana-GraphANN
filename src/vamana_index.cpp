@@ -22,6 +22,32 @@ VamanaIndex::~VamanaIndex() {
         std::free(data_);
         data_ = nullptr;
     }
+    
+    // Clean up the scratch pool
+    for (auto* scratch : scratch_pool_) {
+        delete scratch;
+    }
+    scratch_pool_.clear();
+}
+
+VamanaIndex::SearchScratch* VamanaIndex::get_scratch() const {
+    std::lock_guard<std::mutex> lock(scratch_lock_);
+    if (scratch_pool_.empty()) {
+        auto* scratch = new SearchScratch();
+        // Pre-allocate the visited array to the size of the dataset
+        if (npts_ > 0) {
+            scratch->visited_array.assign(npts_, 0);
+        }
+        return scratch;
+    }
+    auto* scratch = scratch_pool_.back();
+    scratch_pool_.pop_back();
+    return scratch;
+}
+
+void VamanaIndex::release_scratch(SearchScratch* scratch) const {
+    std::lock_guard<std::mutex> lock(scratch_lock_);
+    scratch_pool_.push_back(scratch);
 }
 
 // ============================================================================
@@ -47,17 +73,23 @@ struct CandState {
 
 std::pair<std::vector<VamanaIndex::Candidate>, uint32_t>
 VamanaIndex::greedy_search(const float *query, uint32_t L) const {
-  thread_local std::vector<uint16_t> visited_array;
-  thread_local uint16_t visited_gen = 0;
+  // Borrow a scratch buffer from the concurrent pool
+  SearchScratch* scratch = get_scratch();
+  
+  // Handle dataset size updates if data was loaded after buffer creation
+  if (scratch->visited_array.size() < npts_) {
+    scratch->visited_array.assign(npts_, 0);
+  }
 
-  if (visited_array.size() < npts_) {
-    visited_array.assign(npts_, 0);
+  scratch->visited_gen++;
+  if (scratch->visited_gen == 0) {
+    std::fill(scratch->visited_array.begin(), scratch->visited_array.end(), 0);
+    scratch->visited_gen = 1;
   }
-  visited_gen++;
-  if (visited_gen == 0) {
-    std::fill(visited_array.begin(), visited_array.end(), 0);
-    visited_gen = 1;
-  }
+
+  // Use references to keep the rest of your algorithm syntax identical
+  auto& visited_array = scratch->visited_array;
+  auto& visited_gen = scratch->visited_gen;
 
   std::vector<CandState> candidates;
   candidates.reserve(L + 1);
@@ -126,6 +158,7 @@ VamanaIndex::greedy_search(const float *query, uint32_t L) const {
   for (const auto &c : candidates) {
     results.push_back({c.dist, c.id});
   }
+  release_scratch(scratch); // Return the buffer to the pool for the next query
   return {results, dist_cmps};
 }
 
