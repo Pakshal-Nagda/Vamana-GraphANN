@@ -11,51 +11,86 @@
 #include <set>
 #include <stdexcept>
 #include <cstdlib>
+#include <cmath>
 
 // ============================================================================
 // Destructor
 // ============================================================================
 
 VamanaIndex::~VamanaIndex() {
-    if (owns_data_ && data_) {
-        std::free(data_);
-        data_ = nullptr;
+    if (owns_data_) {
+        if (data_) std::free(data_);
+        if (rotated_data_) std::free(rotated_data_);
     }
 }
 
 // ============================================================================
-// Greedy Search
+// Rotation Utilities
 // ============================================================================
-// Beam search starting from start_node_. Maintains a candidate set of at most
-// L nodes, always expanding the closest unvisited node. Returns when no
-// unvisited candidates remain.
-//
-// Uses std::set<Candidate> as an ordered container — simple, correct, and
-// easy for students to understand and modify.
+
+void VamanaIndex::generate_random_rotation() {
+    rotation_matrix_.assign((size_t)dim_ * dim_, 0.0f);
+    std::mt19937 gen(42); 
+    std::normal_distribution<float> dist(0.0, 1.0);
+
+    // Initialize with Gaussian random variables
+    for (auto& val : rotation_matrix_) val = dist(gen);
+
+    // Gram-Schmidt process to produce an orthonormal basis
+    for (uint32_t i = 0; i < dim_; ++i) {
+        float* row_i = &rotation_matrix_[i * dim_];
+        for (uint32_t j = 0; j < i; ++j) {
+            float* row_j = &rotation_matrix_[j * dim_];
+            float dot = 0;
+            for (uint32_t d = 0; d < dim_; ++d) dot += row_i[d] * row_j[d];
+            for (uint32_t d = 0; d < dim_; ++d) row_i[d] -= dot * row_j[d];
+        }
+        float norm = 0;
+        for (uint32_t d = 0; d < dim_; ++d) norm += row_i[d] * row_i[d];
+        norm = std::sqrt(norm);
+        if (norm > 1e-9f) {
+            for (uint32_t d = 0; d < dim_; ++d) row_i[d] /= norm;
+        }
+    }
+}
+
+void VamanaIndex::apply_rotation(const float* vec, float* out) const {
+    for (uint32_t i = 0; i < dim_; ++i) {
+        float sum = 0;
+        const float* rot_row = &rotation_matrix_[i * dim_];
+        for (uint32_t j = 0; j < dim_; ++j) {
+            sum += rot_row[j] * vec[j];
+        }
+        out[i] = sum;
+    }
+}
+
+// ============================================================================
+// Greedy Search (Updated for Approximation)
+// ============================================================================
 
 std::pair<std::vector<VamanaIndex::Candidate>, uint32_t>
-VamanaIndex::greedy_search(const float* query, uint32_t L) const {
-    // Candidate set: ordered by (distance, id). Bounded at size L.
+VamanaIndex::greedy_search(const float* query, uint32_t L, uint32_t k_approx) const {
     std::set<Candidate> candidate_set;
-    // Track which nodes we've already expanded (visited).
     std::vector<bool> visited(npts_, false);
-
     uint32_t dist_cmps = 0;
+    
+    // Determine effective dimension for distance calculation
+    uint32_t effective_k = (k_approx > 0 && k_approx < dim_) ? k_approx : dim_;
 
-    // Seed with start node
-    float start_dist = compute_l2sq(query, get_vector(start_node_), dim_);
+    // Rotate query into the random basis
+    std::vector<float> rotated_query(dim_);
+    apply_rotation(query, rotated_query.data());
+
+    // Seed with start node using approximate distance
+    float start_dist = compute_l2sq_approx(rotated_query.data(), get_rotated_vector(start_node_), effective_k);
     dist_cmps++;
     candidate_set.insert({start_dist, start_node_});
     visited[start_node_] = true;
 
-    // Track which candidates have been expanded (their neighbors explored).
-    // We iterate through candidate_set; entries before our "frontier" pointer
-    // have been expanded. We use a simple approach: keep scanning from the
-    // beginning of the set for the first un-expanded entry.
     std::set<uint32_t> expanded;
 
     while (true) {
-        // Find closest candidate that hasn't been expanded yet
         uint32_t best_node = UINT32_MAX;
         for (const auto& [dist, id] : candidate_set) {
             if (expanded.find(id) == expanded.end()) {
@@ -63,28 +98,24 @@ VamanaIndex::greedy_search(const float* query, uint32_t L) const {
                 break;
             }
         }
-        if (best_node == UINT32_MAX)
-            break;  // all candidates expanded
+        if (best_node == UINT32_MAX) break;
 
         expanded.insert(best_node);
 
-        // Expand: evaluate all neighbors of best_node
-        // Copy neighbor list under lock to avoid data race with parallel build
-        // (another thread might push_back / reallocate graph_[best_node]).
         std::vector<uint32_t> neighbors;
         {
             std::lock_guard<std::mutex> lock(locks_[best_node]);
             neighbors = graph_[best_node];
         }
+
         for (uint32_t nbr : neighbors) {
-            if (visited[nbr])
-                continue;
+            if (visited[nbr]) continue;
             visited[nbr] = true;
 
-            float d = compute_l2sq(query, get_vector(nbr), dim_);
+            // Use approximate distance for graph traversal
+            float d = compute_l2sq_approx(rotated_query.data(), get_rotated_vector(nbr), effective_k);
             dist_cmps++;
 
-            // Insert if candidate set isn't full or this is closer than worst
             if (candidate_set.size() < L) {
                 candidate_set.insert({d, nbr});
             } else {
@@ -97,67 +128,45 @@ VamanaIndex::greedy_search(const float* query, uint32_t L) const {
         }
     }
 
-    // Convert to sorted vector
-    std::vector<Candidate> results(candidate_set.begin(), candidate_set.end());
-    return {results, dist_cmps};
+    return {{candidate_set.begin(), candidate_set.end()}, dist_cmps};
 }
 
 // ============================================================================
-// Robust Prune (Alpha-RNG Rule)
+// Robust Prune & Build Logic
 // ============================================================================
-// Given a node and a set of candidates, greedily select neighbors that are
-// "diverse" — a candidate c is added only if it's not too close to any
-// already-selected neighbor (within a factor of alpha).
-//
-// Formally: add c if for ALL already-chosen neighbors n:
-//     dist(node, c) <= alpha * dist(c, n)
-//
-// This ensures good graph navigability by keeping some long-range edges
-// (alpha > 1 makes it easier for a candidate to survive pruning).
 
 void VamanaIndex::robust_prune(uint32_t node, std::vector<Candidate>& candidates,
                                float alpha, uint32_t R) {
-    // Remove self from candidates if present
     candidates.erase(
         std::remove_if(candidates.begin(), candidates.end(),
                        [node](const Candidate& c) { return c.second == node; }),
         candidates.end());
 
-    // Sort by distance to node (ascending)
     std::sort(candidates.begin(), candidates.end());
 
     std::vector<uint32_t> new_neighbors;
     new_neighbors.reserve(R);
 
     for (const auto& [dist_to_node, cand_id] : candidates) {
-        if (new_neighbors.size() >= R)
-            break;
+        if (new_neighbors.size() >= R) break;
 
-        // Check alpha-RNG condition against all already-selected neighbors
         bool keep = true;
         for (uint32_t selected : new_neighbors) {
-            float dist_cand_to_selected =
-                compute_l2sq(get_vector(cand_id), get_vector(selected), dim_);
+            // Pruning still uses full distance for graph quality
+            float dist_cand_to_selected = compute_l2sq(get_vector(cand_id), get_vector(selected), dim_);
             if (dist_to_node > alpha * dist_cand_to_selected) {
                 keep = false;
                 break;
             }
         }
 
-        if (keep)
-            new_neighbors.push_back(cand_id);
+        if (keep) new_neighbors.push_back(cand_id);
     }
-
     graph_[node] = std::move(new_neighbors);
 }
 
-// ============================================================================
-// Build
-// ============================================================================
-
 void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
                         float alpha, float gamma) {
-    // --- Load data ---
     std::cout << "Loading data from " << data_path << "..." << std::endl;
     FloatMatrix mat = load_fbin(data_path);
     npts_ = mat.npts;
@@ -165,60 +174,42 @@ void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
     data_ = mat.data.release();
     owns_data_ = true;
 
-    std::cout << "  Points: " << npts_ << ", Dimensions: " << dim_ << std::endl;
-
-    if (L < R) {
-        std::cerr << "Warning: L (" << L << ") < R (" << R
-                  << "). Setting L = R." << std::endl;
-        L = R;
+    // Generate rotation and pre-rotate dataset
+    generate_random_rotation();
+    size_t data_size = (size_t)npts_ * dim_ * sizeof(float);
+    rotated_data_ = static_cast<float*>(std::aligned_alloc(64, (data_size + 63) & ~(size_t)63));
+    
+    #pragma omp parallel for schedule(static)
+    for (uint32_t i = 0; i < npts_; ++i) {
+        apply_rotation(get_vector(i), rotated_data_ + (size_t)i * dim_);
     }
 
-    // --- Initialize empty graph and per-node locks ---
     graph_.resize(npts_);
     locks_ = std::vector<std::mutex>(npts_);
 
-    // --- Pick random start node ---
-    std::mt19937 rng(42);  // fixed seed for reproducibility
+    std::mt19937 rng(42);
     start_node_ = rng() % npts_;
-    std::cout << "  Start node: " << start_node_ << std::endl;
 
-    // --- Create random insertion order ---
     std::vector<uint32_t> perm(npts_);
     std::iota(perm.begin(), perm.end(), 0);
     std::shuffle(perm.begin(), perm.end(), rng);
 
-    // --- Build graph: parallel insertion with per-node locking ---
     uint32_t gamma_R = static_cast<uint32_t>(gamma * R);
-    std::cout << "Building index (R=" << R << ", L=" << L
-              << ", alpha=" << alpha << ", gamma=" << gamma
-              << ", gammaR=" << gamma_R << ")..." << std::endl;
-
     Timer build_timer;
 
     #pragma omp parallel for schedule(dynamic, 64)
     for (size_t idx = 0; idx < npts_; idx++) {
         uint32_t point = perm[idx];
-
-        // Step 1: Search for this point in the current graph to find candidates
-        auto [candidates, _dist_cmps] = greedy_search(get_vector(point), L);
-
-        // Step 2: Prune candidates to get this point's neighbors
-        // We don't need to lock graph_[point] here because each point appears
-        // exactly once in the permutation — only this thread writes to it now.
+        // Build phase uses full distance (k_approx = 0)
+        auto [candidates, _dist_cmps] = greedy_search(get_vector(point), L, 0);
         robust_prune(point, candidates, alpha, R);
 
-        // Step 3: Add backward edges from each new neighbor back to this point
         for (uint32_t nbr : graph_[point]) {
             std::lock_guard<std::mutex> lock(locks_[nbr]);
-
-            // Add backward edge
             graph_[nbr].push_back(point);
 
-            // Step 4: If neighbor's degree exceeds gamma*R, prune its neighborhood
             if (graph_[nbr].size() > gamma_R) {
-                // Build candidate list from current neighbors of nbr
                 std::vector<Candidate> nbr_candidates;
-                nbr_candidates.reserve(graph_[nbr].size());
                 for (uint32_t nn : graph_[nbr]) {
                     float d = compute_l2sq(get_vector(nbr), get_vector(nn), dim_);
                     nbr_candidates.push_back({d, nn});
@@ -226,42 +217,21 @@ void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
                 robust_prune(nbr, nbr_candidates, alpha, R);
             }
         }
-
-        // Progress reporting (from one thread only)
-        if (idx % 10000 == 0) {
-            #pragma omp critical
-            {
-                std::cout << "\r  Inserted " << idx << " / " << npts_
-                          << " points" << std::flush;
-            }
-        }
     }
-
-    double build_time = build_timer.elapsed_seconds();
-
-    // Compute average degree
-    size_t total_edges = 0;
-    for (uint32_t i = 0; i < npts_; i++)
-        total_edges += graph_[i].size();
-    double avg_degree = (double)total_edges / npts_;
-
-    std::cout << "\n  Build complete in " << build_time << " seconds."
-              << std::endl;
-    std::cout << "  Average out-degree: " << avg_degree << std::endl;
+    std::cout << "\nBuild complete in " << build_timer.elapsed_seconds() << " seconds." << std::endl;
 }
 
 // ============================================================================
-// Search
+// Search & Persistence
 // ============================================================================
 
-SearchResult VamanaIndex::search(const float* query, uint32_t K, uint32_t L) const {
+SearchResult VamanaIndex::search(const float* query, uint32_t K, uint32_t L, uint32_t k_approx) const {
     if (L < K) L = K;
 
     Timer t;
-    auto [candidates, dist_cmps] = greedy_search(query, L);
+    auto [candidates, dist_cmps] = greedy_search(query, L, k_approx);
     double latency = t.elapsed_us();
 
-    // Return top-K results
     SearchResult result;
     result.dist_cmps = dist_cmps;
     result.latency_us = latency;
@@ -272,76 +242,51 @@ SearchResult VamanaIndex::search(const float* query, uint32_t K, uint32_t L) con
     return result;
 }
 
-// ============================================================================
-// Save / Load
-// ============================================================================
-// Binary format:
-//   [uint32] npts
-//   [uint32] dim
-//   [uint32] start_node
-//   For each node i in [0, npts):
-//     [uint32] degree
-//     [uint32 * degree] neighbor IDs
-
 void VamanaIndex::save(const std::string& path) const {
     std::ofstream out(path, std::ios::binary);
-    if (!out.is_open())
-        throw std::runtime_error("Cannot open file for writing: " + path);
+    if (!out.is_open()) throw std::runtime_error("Cannot open file: " + path);
 
     out.write(reinterpret_cast<const char*>(&npts_), 4);
     out.write(reinterpret_cast<const char*>(&dim_), 4);
     out.write(reinterpret_cast<const char*>(&start_node_), 4);
 
+    // Save rotation matrix for consistency during load
+    out.write(reinterpret_cast<const char*>(rotation_matrix_.data()), rotation_matrix_.size() * sizeof(float));
+
     for (uint32_t i = 0; i < npts_; i++) {
         uint32_t deg = graph_[i].size();
         out.write(reinterpret_cast<const char*>(&deg), 4);
-        if (deg > 0) {
-            out.write(reinterpret_cast<const char*>(graph_[i].data()),
-                      deg * sizeof(uint32_t));
-        }
+        if (deg > 0) out.write(reinterpret_cast<const char*>(graph_[i].data()), deg * sizeof(uint32_t));
     }
-
-    std::cout << "Index saved to " << path << std::endl;
 }
 
-void VamanaIndex::load(const std::string& index_path,
-                       const std::string& data_path) {
-    // Load data vectors
+void VamanaIndex::load(const std::string& index_path, const std::string& data_path) {
     FloatMatrix mat = load_fbin(data_path);
     npts_ = mat.npts;
     dim_  = mat.dims;
     data_ = mat.data.release();
     owns_data_ = true;
 
-    // Load graph
     std::ifstream in(index_path, std::ios::binary);
-    if (!in.is_open())
-        throw std::runtime_error("Cannot open index file: " + index_path);
-
-    uint32_t file_npts, file_dim;
-    in.read(reinterpret_cast<char*>(&file_npts), 4);
-    in.read(reinterpret_cast<char*>(&file_dim), 4);
+    uint32_t f_npts, f_dim;
+    in.read(reinterpret_cast<char*>(&f_npts), 4);
+    in.read(reinterpret_cast<char*>(&f_dim), 4);
     in.read(reinterpret_cast<char*>(&start_node_), 4);
 
-    if (file_npts != npts_ || file_dim != dim_)
-        throw std::runtime_error(
-            "Index/data mismatch: index has " + std::to_string(file_npts) +
-            "x" + std::to_string(file_dim) + ", data has " +
-            std::to_string(npts_) + "x" + std::to_string(dim_));
+    rotation_matrix_.resize((size_t)dim_ * dim_);
+    in.read(reinterpret_cast<char*>(rotation_matrix_.data()), rotation_matrix_.size() * sizeof(float));
+
+    // Pre-rotate loaded data
+    size_t data_size = (size_t)npts_ * dim_ * sizeof(float);
+    rotated_data_ = static_cast<float*>(std::aligned_alloc(64, (data_size + 63) & ~(size_t)63));
+    for (uint32_t i = 0; i < npts_; ++i) apply_rotation(get_vector(i), rotated_data_ + (size_t)i * dim_);
 
     graph_.resize(npts_);
     locks_ = std::vector<std::mutex>(npts_);
-
     for (uint32_t i = 0; i < npts_; i++) {
         uint32_t deg;
         in.read(reinterpret_cast<char*>(&deg), 4);
         graph_[i].resize(deg);
-        if (deg > 0) {
-            in.read(reinterpret_cast<char*>(graph_[i].data()),
-                    deg * sizeof(uint32_t));
-        }
+        if (deg > 0) in.read(reinterpret_cast<char*>(graph_[i].data()), deg * sizeof(uint32_t));
     }
-
-    std::cout << "Index loaded: " << npts_ << " points, " << dim_
-              << " dims, start=" << start_node_ << std::endl;
 }

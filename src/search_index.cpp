@@ -19,6 +19,7 @@ static void print_usage(const char* prog) {
               << " --gt <ground_truth_ibin_path>"
               << " --K <num_neighbors>"
               << " --L <comma_separated_L_values>"
+              << " [--k_approx <k_coordinates>]"
               << std::endl;
 }
 
@@ -52,6 +53,7 @@ static double compute_recall(const std::vector<uint32_t>& result,
 int main(int argc, char** argv) {
     std::string index_path, data_path, query_path, gt_path, L_str;
     uint32_t K = 10;
+    uint32_t k_approx = 0; // Default: 0 means use full dimensionality
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -61,6 +63,7 @@ int main(int argc, char** argv) {
         else if (arg == "--gt" && i + 1 < argc)   gt_path = argv[++i];
         else if (arg == "--K" && i + 1 < argc)    K = std::atoi(argv[++i]);
         else if (arg == "--L" && i + 1 < argc)    L_str = argv[++i];
+        else if (arg == "--k_approx" && i + 1 < argc) k_approx = std::atoi(argv[++i]);
         else if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
             return 0;
@@ -80,6 +83,8 @@ int main(int argc, char** argv) {
     }
 
     // --- Load index ---
+    // Note: The load() implementation in vamana_index.cpp now handles 
+    // loading the rotation matrix and pre-rotating the data.
     std::cout << "Loading index..." << std::endl;
     VamanaIndex index;
     index.load(index_path, data_path);
@@ -114,7 +119,11 @@ int main(int argc, char** argv) {
     uint32_t nq = queries.npts;
 
     // --- Run search for each L value ---
-    std::cout << "\n=== Search Results (K=" << K << ") ===" << std::endl;
+    std::cout << "\n=== Search Results (K=" << K;
+    if (k_approx > 0) std::cout << ", k_approx=" << k_approx;
+    else std::cout << ", Full Dimension";
+    std::cout << ") ===" << std::endl;
+
     std::cout << std::setw(8) << "L"
               << std::setw(14) << "Recall@" + std::to_string(K)
               << std::setw(16) << "Avg Dist Cmps"
@@ -130,7 +139,8 @@ int main(int argc, char** argv) {
 
         #pragma omp parallel for schedule(dynamic, 16)
         for (uint32_t q = 0; q < nq; q++) {
-            SearchResult res = index.search(queries.row(q), K, L);
+            // Updated search call to pass the k_approx parameter
+            SearchResult res = index.search(queries.row(q), K, L, k_approx);
 
             recalls[q] = compute_recall(res.ids, gt.row(q), K);
             dist_cmps[q] = res.dist_cmps;
