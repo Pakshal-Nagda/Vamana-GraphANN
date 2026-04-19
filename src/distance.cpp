@@ -8,12 +8,3 @@ float compute_l2sq(const float* a, const float* b, uint32_t dim) {
     }
     return sum;
 }
-
-float compute_l2sq_approx(const float* a, const float* b, uint32_t limit) {
-    float sum = 0.0f;
-    for (uint32_t i = 0; i < limit; i++) {
-        float diff = a[i] - b[i];
-        sum += diff * diff;
-    }
-    return sum;
-}

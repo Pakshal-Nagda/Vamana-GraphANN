@@ -32,6 +32,7 @@ VamanaIndex::~VamanaIndex() {
 //
 // Uses std::set<Candidate> as an ordered container — simple, correct, and
 // easy for students to understand and modify.
+<<<<<<< HEAD
 
 struct CandState {
   float dist;
@@ -77,11 +78,47 @@ VamanaIndex::greedy_search(const float *query, uint32_t L) const {
     }
     if (best_idx == candidates.size())
       break;
+=======
+
+std::pair<std::vector<VamanaIndex::Candidate>, uint32_t>
+VamanaIndex::greedy_search(const float* query, uint32_t L) const {
+    // Candidate set: ordered by (distance, id). Bounded at size L.
+    std::set<Candidate> candidate_set;
+    // Track which nodes we've already expanded (visited).
+    std::vector<bool> visited(npts_, false);
+
+    uint32_t dist_cmps = 0;
+
+    // Seed with start node
+    float start_dist = compute_l2sq(query, get_vector(start_node_), dim_);
+    dist_cmps++;
+    candidate_set.insert({start_dist, start_node_});
+    visited[start_node_] = true;
+
+    // Track which candidates have been expanded (their neighbors explored).
+    // We iterate through candidate_set; entries before our "frontier" pointer
+    // have been expanded. We use a simple approach: keep scanning from the
+    // beginning of the set for the first un-expanded entry.
+    std::set<uint32_t> expanded;
+
+    while (true) {
+        // Find closest candidate that hasn't been expanded yet
+        uint32_t best_node = UINT32_MAX;
+        for (const auto& [dist, id] : candidate_set) {
+            if (expanded.find(id) == expanded.end()) {
+                best_node = id;
+                break;
+            }
+        }
+        if (best_node == UINT32_MAX)
+            break;  // all candidates expanded
+>>>>>>> parent of 83549e8 (k-approx)
 
     candidates[best_idx].expanded = true;
     uint32_t best_node = candidates[best_idx].id;
     float worst_dist = candidates.back().dist;
 
+<<<<<<< HEAD
     std::vector<uint32_t> neighbors;
     {
       std::lock_guard<std::mutex> lock(locks_[best_node]);
@@ -126,6 +163,40 @@ VamanaIndex::greedy_search(const float *query, uint32_t L) const {
     results.push_back({c.dist, c.id});
   }
   return {results, dist_cmps};
+=======
+        // Expand: evaluate all neighbors of best_node
+        // Copy neighbor list under lock to avoid data race with parallel build
+        // (another thread might push_back / reallocate graph_[best_node]).
+        std::vector<uint32_t> neighbors;
+        {
+            std::lock_guard<std::mutex> lock(locks_[best_node]);
+            neighbors = graph_[best_node];
+        }
+        for (uint32_t nbr : neighbors) {
+            if (visited[nbr])
+                continue;
+            visited[nbr] = true;
+
+            float d = compute_l2sq(query, get_vector(nbr), dim_);
+            dist_cmps++;
+
+            // Insert if candidate set isn't full or this is closer than worst
+            if (candidate_set.size() < L) {
+                candidate_set.insert({d, nbr});
+            } else {
+                auto worst = std::prev(candidate_set.end());
+                if (d < worst->first) {
+                    candidate_set.erase(worst);
+                    candidate_set.insert({d, nbr});
+                }
+            }
+        }
+    }
+
+    // Convert to sorted vector
+    std::vector<Candidate> results(candidate_set.begin(), candidate_set.end());
+    return {results, dist_cmps};
+>>>>>>> parent of 83549e8 (k-approx)
 }
 
 // ============================================================================
@@ -141,6 +212,7 @@ VamanaIndex::greedy_search(const float *query, uint32_t L) const {
 // This ensures good graph navigability by keeping some long-range edges
 // (alpha > 1 makes it easier for a candidate to survive pruning).
 
+<<<<<<< HEAD
 void VamanaIndex::robust_prune(uint32_t node,
                                std::vector<Candidate> &candidates, float alpha,
                                uint32_t R) {
@@ -152,10 +224,23 @@ void VamanaIndex::robust_prune(uint32_t node,
 
   // Sort by distance to node (ascending)
   std::sort(candidates.begin(), candidates.end());
+=======
+void VamanaIndex::robust_prune(uint32_t node, std::vector<Candidate>& candidates,
+                               float alpha, uint32_t R) {
+    // Remove self from candidates if present
+    candidates.erase(
+        std::remove_if(candidates.begin(), candidates.end(),
+                       [node](const Candidate& c) { return c.second == node; }),
+        candidates.end());
+
+    // Sort by distance to node (ascending)
+    std::sort(candidates.begin(), candidates.end());
+>>>>>>> parent of 83549e8 (k-approx)
 
   std::vector<uint32_t> new_neighbors;
   new_neighbors.reserve(R);
 
+<<<<<<< HEAD
   for (size_t i = 0; i < candidates.size(); i++) {
     if (i + 1 < candidates.size()) {
       __builtin_prefetch(get_vector(candidates[i + 1].second), 0, 1);
@@ -181,6 +266,28 @@ void VamanaIndex::robust_prune(uint32_t node,
   }
 
   graph_[node] = std::move(new_neighbors);
+=======
+    for (const auto& [dist_to_node, cand_id] : candidates) {
+        if (new_neighbors.size() >= R)
+            break;
+
+        // Check alpha-RNG condition against all already-selected neighbors
+        bool keep = true;
+        for (uint32_t selected : new_neighbors) {
+            float dist_cand_to_selected =
+                compute_l2sq(get_vector(cand_id), get_vector(selected), dim_);
+            if (dist_to_node > alpha * dist_cand_to_selected) {
+                keep = false;
+                break;
+            }
+        }
+
+        if (keep)
+            new_neighbors.push_back(cand_id);
+    }
+
+    graph_[node] = std::move(new_neighbors);
+>>>>>>> parent of 83549e8 (k-approx)
 }
 
 // ============================================================================
@@ -209,6 +316,7 @@ void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
     graph_.resize(npts_);
     locks_ = std::vector<std::mutex>(npts_);
 
+<<<<<<< HEAD
     // --- Compute Centroid and Pick Medoid Start Node ---
         std::cout << "  Computing medoid start node..." << std::endl;
         std::vector<float> centroid(dim_, 0.0f);
@@ -269,6 +377,13 @@ void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
         // Re-initialize RNG for the permutation step
         std::mt19937 rng(42);
 
+=======
+    // --- Pick random start node ---
+    std::mt19937 rng(42);  // fixed seed for reproducibility
+    start_node_ = rng() % npts_;
+    std::cout << "  Start node: " << start_node_ << std::endl;
+
+>>>>>>> parent of 83549e8 (k-approx)
     // --- Create random insertion order ---
     std::vector<uint32_t> perm(npts_);
     std::iota(perm.begin(), perm.end(), 0);
