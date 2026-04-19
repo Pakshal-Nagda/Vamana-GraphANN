@@ -177,10 +177,65 @@ void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
     graph_.resize(npts_);
     locks_ = std::vector<std::mutex>(npts_);
 
-    // --- Pick random start node ---
-    std::mt19937 rng(42);  // fixed seed for reproducibility
-    start_node_ = rng() % npts_;
-    std::cout << "  Start node: " << start_node_ << std::endl;
+    // --- Compute Centroid and Pick Medoid Start Node ---
+        std::cout << "  Computing medoid start node..." << std::endl;
+        std::vector<float> centroid(dim_, 0.0f);
+
+        // 1. Calculate the centroid (mean vector) in parallel
+        #pragma omp parallel
+        {
+            std::vector<float> local_centroid(dim_, 0.0f);
+            #pragma omp for
+            for (size_t i = 0; i < npts_; i++) {
+                const float* vec = get_vector(i);
+                for (size_t d = 0; d < dim_; d++) {
+                    local_centroid[d] += vec[d];
+                }
+            }
+            
+            #pragma omp critical
+            {
+                for (size_t d = 0; d < dim_; d++) {
+                    centroid[d] += local_centroid[d];
+                }
+            }
+        }
+
+        for (size_t d = 0; d < dim_; d++) {
+            centroid[d] /= npts_;
+        }
+
+        // 2. Find the point closest to the centroid (the medoid)
+        float min_dist = std::numeric_limits<float>::max();
+        start_node_ = 0;
+
+        #pragma omp parallel
+        {
+            float local_min_dist = std::numeric_limits<float>::max();
+            uint32_t local_best = 0;
+
+            #pragma omp for
+            for (size_t i = 0; i < npts_; i++) {
+                float dist = compute_l2sq(centroid.data(), get_vector(i), dim_);
+                if (dist < local_min_dist) {
+                    local_min_dist = dist;
+                    local_best = i;
+                }
+            }
+
+            #pragma omp critical
+            {
+                if (local_min_dist < min_dist) {
+                    min_dist = local_min_dist;
+                    start_node_ = local_best;
+                }
+            }
+        }
+
+        std::cout << "  Start node (medoid): " << start_node_ << std::endl;
+
+        // Re-initialize RNG for the permutation step
+        std::mt19937 rng(42);
 
     // --- Create random insertion order ---
     std::vector<uint32_t> perm(npts_);
