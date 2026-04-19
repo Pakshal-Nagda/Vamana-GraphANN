@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <cstdlib>
 #include <cmath>
+#include <limits>
 
 // ============================================================================
 // Destructor
@@ -25,7 +26,7 @@ VamanaIndex::~VamanaIndex() {
 }
 
 // ============================================================================
-// Rotation Utilities
+// Rotation & Medoid Utilities
 // ============================================================================
 
 void VamanaIndex::generate_random_rotation() {
@@ -33,10 +34,9 @@ void VamanaIndex::generate_random_rotation() {
     std::mt19937 gen(42); 
     std::normal_distribution<float> dist(0.0, 1.0);
 
-    // Initialize with Gaussian random variables
     for (auto& val : rotation_matrix_) val = dist(gen);
 
-    // Gram-Schmidt process to produce an orthonormal basis
+    // Gram-Schmidt to produce orthonormal basis
     for (uint32_t i = 0; i < dim_; ++i) {
         float* row_i = &rotation_matrix_[i * dim_];
         for (uint32_t j = 0; j < i; ++j) {
@@ -66,7 +66,7 @@ void VamanaIndex::apply_rotation(const float* vec, float* out) const {
 }
 
 // ============================================================================
-// Greedy Search (Updated for Approximation)
+// Greedy Search (Merged with Approximation Support)
 // ============================================================================
 
 std::pair<std::vector<VamanaIndex::Candidate>, uint32_t>
@@ -75,14 +75,13 @@ VamanaIndex::greedy_search(const float* query, uint32_t L, uint32_t k_approx) co
     std::vector<bool> visited(npts_, false);
     uint32_t dist_cmps = 0;
     
-    // Determine effective dimension for distance calculation
     uint32_t effective_k = (k_approx > 0 && k_approx < dim_) ? k_approx : dim_;
 
-    // Rotate query into the random basis
+    // Rotate query for approximate distance comparison
     std::vector<float> rotated_query(dim_);
     apply_rotation(query, rotated_query.data());
 
-    // Seed with start node using approximate distance
+    // Seed with start node
     float start_dist = compute_l2sq_approx(rotated_query.data(), get_rotated_vector(start_node_), effective_k);
     dist_cmps++;
     candidate_set.insert({start_dist, start_node_});
@@ -112,7 +111,6 @@ VamanaIndex::greedy_search(const float* query, uint32_t L, uint32_t k_approx) co
             if (visited[nbr]) continue;
             visited[nbr] = true;
 
-            // Use approximate distance for graph traversal
             float d = compute_l2sq_approx(rotated_query.data(), get_rotated_vector(nbr), effective_k);
             dist_cmps++;
 
@@ -132,7 +130,7 @@ VamanaIndex::greedy_search(const float* query, uint32_t L, uint32_t k_approx) co
 }
 
 // ============================================================================
-// Robust Prune & Build Logic
+// Robust Prune & Build (Merged with Medoid Logic)
 // ============================================================================
 
 void VamanaIndex::robust_prune(uint32_t node, std::vector<Candidate>& candidates,
@@ -152,14 +150,12 @@ void VamanaIndex::robust_prune(uint32_t node, std::vector<Candidate>& candidates
 
         bool keep = true;
         for (uint32_t selected : new_neighbors) {
-            // Pruning still uses full distance for graph quality
             float dist_cand_to_selected = compute_l2sq(get_vector(cand_id), get_vector(selected), dim_);
             if (dist_to_node > alpha * dist_cand_to_selected) {
                 keep = false;
                 break;
             }
         }
-
         if (keep) new_neighbors.push_back(cand_id);
     }
     graph_[node] = std::move(new_neighbors);
@@ -174,7 +170,7 @@ void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
     data_ = mat.data.release();
     owns_data_ = true;
 
-    // Generate rotation and pre-rotate dataset
+    // 1. Generate rotation and pre-rotate dataset
     generate_random_rotation();
     size_t data_size = (size_t)npts_ * dim_ * sizeof(float);
     rotated_data_ = static_cast<float*>(std::aligned_alloc(64, (data_size + 63) & ~(size_t)63));
@@ -187,9 +183,51 @@ void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
     graph_.resize(npts_);
     locks_ = std::vector<std::mutex>(npts_);
 
-    std::mt19937 rng(42);
-    start_node_ = rng() % npts_;
+    // 2. Compute Centroid and Pick Medoid Start Node
+    std::cout << "  Computing medoid start node..." << std::endl;
+    std::vector<float> centroid(dim_, 0.0f);
 
+    #pragma omp parallel
+    {
+        std::vector<float> local_centroid(dim_, 0.0f);
+        #pragma omp for
+        for (size_t i = 0; i < npts_; i++) {
+            const float* vec = get_vector(i);
+            for (size_t d = 0; d < dim_; d++) local_centroid[d] += vec[d];
+        }
+        #pragma omp critical
+        {
+            for (size_t d = 0; d < dim_; d++) centroid[d] += local_centroid[d];
+        }
+    }
+    for (size_t d = 0; d < dim_; d++) centroid[d] /= npts_;
+
+    float min_dist = std::numeric_limits<float>::max();
+    start_node_ = 0;
+    #pragma omp parallel
+    {
+        float local_min_dist = std::numeric_limits<float>::max();
+        uint32_t local_best = 0;
+        #pragma omp for
+        for (size_t i = 0; i < npts_; i++) {
+            float dist = compute_l2sq(centroid.data(), get_vector(i), dim_);
+            if (dist < local_min_dist) {
+                local_min_dist = dist;
+                local_best = i;
+            }
+        }
+        #pragma omp critical
+        {
+            if (local_min_dist < min_dist) {
+                min_dist = local_min_dist;
+                start_node_ = local_best;
+            }
+        }
+    }
+    std::cout << "  Start node (medoid): " << start_node_ << std::endl;
+
+    // 3. Build Graph
+    std::mt19937 rng(42);
     std::vector<uint32_t> perm(npts_);
     std::iota(perm.begin(), perm.end(), 0);
     std::shuffle(perm.begin(), perm.end(), rng);
@@ -200,7 +238,7 @@ void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
     #pragma omp parallel for schedule(dynamic, 64)
     for (size_t idx = 0; idx < npts_; idx++) {
         uint32_t point = perm[idx];
-        // Build phase uses full distance (k_approx = 0)
+        // Build phase always uses full distance (k_approx = 0)
         auto [candidates, _dist_cmps] = greedy_search(get_vector(point), L, 0);
         robust_prune(point, candidates, alpha, R);
 
@@ -218,16 +256,15 @@ void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
             }
         }
     }
-    std::cout << "\nBuild complete in " << build_timer.elapsed_seconds() << " seconds." << std::endl;
+    std::cout << "Build complete in " << build_timer.elapsed_seconds() << " seconds." << std::endl;
 }
 
 // ============================================================================
-// Search & Persistence
+// Search & Persistence (Merged)
 // ============================================================================
 
 SearchResult VamanaIndex::search(const float* query, uint32_t K, uint32_t L, uint32_t k_approx) const {
     if (L < K) L = K;
-
     Timer t;
     auto [candidates, dist_cmps] = greedy_search(query, L, k_approx);
     double latency = t.elapsed_us();
@@ -250,7 +287,6 @@ void VamanaIndex::save(const std::string& path) const {
     out.write(reinterpret_cast<const char*>(&dim_), 4);
     out.write(reinterpret_cast<const char*>(&start_node_), 4);
 
-    // Save rotation matrix for consistency during load
     out.write(reinterpret_cast<const char*>(rotation_matrix_.data()), rotation_matrix_.size() * sizeof(float));
 
     for (uint32_t i = 0; i < npts_; i++) {
@@ -268,15 +304,13 @@ void VamanaIndex::load(const std::string& index_path, const std::string& data_pa
     owns_data_ = true;
 
     std::ifstream in(index_path, std::ios::binary);
-    uint32_t f_npts, f_dim;
-    in.read(reinterpret_cast<char*>(&f_npts), 4);
-    in.read(reinterpret_cast<char*>(&f_dim), 4);
+    in.read(reinterpret_cast<char*>(&npts_), 4);
+    in.read(reinterpret_cast<char*>(&dim_), 4);
     in.read(reinterpret_cast<char*>(&start_node_), 4);
 
     rotation_matrix_.resize((size_t)dim_ * dim_);
     in.read(reinterpret_cast<char*>(rotation_matrix_.data()), rotation_matrix_.size() * sizeof(float));
 
-    // Pre-rotate loaded data
     size_t data_size = (size_t)npts_ * dim_ * sizeof(float);
     rotated_data_ = static_cast<float*>(std::aligned_alloc(64, (data_size + 63) & ~(size_t)63));
     for (uint32_t i = 0; i < npts_; ++i) apply_rotation(get_vector(i), rotated_data_ + (size_t)i * dim_);
