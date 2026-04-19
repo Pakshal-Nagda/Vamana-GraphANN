@@ -11,6 +11,7 @@
 #include <set>
 #include <stdexcept>
 #include <cstdlib>
+#include <omp.h>
 
 // ============================================================================
 // Destructor
@@ -153,6 +154,12 @@ void VamanaIndex::robust_prune(uint32_t node,
   // Sort by distance to node (ascending)
   std::sort(candidates.begin(), candidates.end());
 
+  // Deduplicate candidates based on node ID
+  candidates.erase(
+      std::unique(candidates.begin(), candidates.end(), 
+          [](const Candidate& a, const Candidate& b) { return a.second == b.second; }),
+      candidates.end());
+
   std::vector<uint32_t> new_neighbors;
   new_neighbors.reserve(R);
 
@@ -208,6 +215,29 @@ void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
     // --- Initialize empty graph and per-node locks ---
     graph_.resize(npts_);
     locks_ = std::vector<std::mutex>(npts_);
+
+    // --- Initialize random R-regular graph ---
+    std::cout << "  Initializing random graph with degree " << R << "..." << std::endl;
+    #pragma omp parallel
+    {
+        // Use thread-local RNG to avoid locking contention
+        std::mt19937 local_rng(42 + omp_get_thread_num());
+        
+        #pragma omp for
+        for (size_t i = 0; i < npts_; i++) {
+            std::vector<uint32_t> neighbors;
+            neighbors.reserve(R);
+            
+            // Assign R random unique neighbors
+            while (neighbors.size() < R) {
+                uint32_t nbr = std::uniform_int_distribution<uint32_t>(0, npts_ - 1)(local_rng);
+                if (nbr != i && std::find(neighbors.begin(), neighbors.end(), nbr) == neighbors.end()) {
+                    neighbors.push_back(nbr);
+                }
+            }
+            graph_[i] = std::move(neighbors);
+        }
+    }
 
     // --- Compute Centroid and Pick Medoid Start Node ---
         std::cout << "  Computing medoid start node..." << std::endl;
@@ -274,54 +304,76 @@ void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
     std::iota(perm.begin(), perm.end(), 0);
     std::shuffle(perm.begin(), perm.end(), rng);
 
-    // --- Build graph: parallel insertion with per-node locking ---
+    // --- Build graph: Two-Pass Framework ---
     uint32_t gamma_R = static_cast<uint32_t>(gamma * R);
     std::cout << "Building index (R=" << R << ", L=" << L
-              << ", alpha=" << alpha << ", gamma=" << gamma
+              << ", final alpha=" << alpha << ", gamma=" << gamma
               << ", gammaR=" << gamma_R << ")..." << std::endl;
 
     Timer build_timer;
 
-    #pragma omp parallel for schedule(dynamic, 64)
-    for (size_t idx = 0; idx < npts_; idx++) {
-        uint32_t point = perm[idx];
+    // Run the insertion process twice
+    for (int pass = 1; pass <= 2; pass++) {
+        // Pass 1: alpha = 1.0 to build strong local neighborhoods
+        // Pass 2: alpha = user-provided alpha to add long-range shortcut edges
+        float pass_alpha = (pass == 1) ? 1.0f : alpha;
+        
+        std::cout << "\n  --- Starting Pass " << pass << " with alpha = " << pass_alpha << " ---" << std::endl;
 
-        // Step 1: Search for this point in the current graph to find candidates
-        auto [candidates, _dist_cmps] = greedy_search(get_vector(point), L);
+        #pragma omp parallel for schedule(dynamic, 64)
+        for (size_t idx = 0; idx < npts_; idx++) {
+            uint32_t point = perm[idx];
 
-        // Step 2: Prune candidates to get this point's neighbors
-        // We don't need to lock graph_[point] here because each point appears
-        // exactly once in the permutation — only this thread writes to it now.
-        robust_prune(point, candidates, alpha, R);
+            // Step 1: Search for this point in the current graph to find candidates
+            auto [candidates, _dist_cmps] = greedy_search(get_vector(point), L);
 
-        // Step 3: Add backward edges from each new neighbor back to this point
-        for (uint32_t nbr : graph_[point]) {
-            std::lock_guard<std::mutex> lock(locks_[nbr]);
-
-            // Add backward edge
-            graph_[nbr].push_back(point);
-
-            // Step 4: If neighbor's degree exceeds gamma*R, prune its neighborhood
-            if (graph_[nbr].size() > gamma_R) {
-                // Build candidate list from current neighbors of nbr
-                std::vector<Candidate> nbr_candidates;
-                nbr_candidates.reserve(graph_[nbr].size());
-                for (uint32_t nn : graph_[nbr]) {
-                    float d = compute_l2sq(get_vector(nbr), get_vector(nn), dim_);
-                    nbr_candidates.push_back({d, nn});
-                }
-                robust_prune(nbr, nbr_candidates, alpha, R);
-            }
-        }
-
-        // Progress reporting (from one thread only)
-        if (idx % 10000 == 0) {
-            #pragma omp critical
+            // Step 1.5 & 2: Merge existing neighbors and prune safely under a lock
+            std::vector<uint32_t> new_neighbors;
             {
-                std::cout << "\r  Inserted " << idx << " / " << npts_
-                          << " points" << std::flush;
+                std::lock_guard<std::mutex> lock(locks_[point]);
+                
+                // Merge existing edges (crucial for random graph and Pass 2)
+                for (uint32_t nbr : graph_[point]) {
+                    float d = compute_l2sq(get_vector(point), get_vector(nbr), dim_);
+                    candidates.push_back({d, nbr});
+                }
+                
+                // Prune candidates into the final neighborhood
+                robust_prune(point, candidates, pass_alpha, R);
+                
+                // Copy the pruned neighbors so we can safely iterate outside this lock
+                new_neighbors = graph_[point];
+            } // locks_[point] is released here to prevent deadlocks in Step 3
+
+            // Step 3: Add backward edges from each new neighbor back to this point
+            for (uint32_t nbr : new_neighbors) {
+                std::lock_guard<std::mutex> lock(locks_[nbr]);
+
+                // Add backward edge
+                graph_[nbr].push_back(point);
+
+                // Step 4: If neighbor's degree exceeds gamma*R, prune its neighborhood
+                if (graph_[nbr].size() > gamma_R) {
+                    std::vector<Candidate> nbr_candidates;
+                    nbr_candidates.reserve(graph_[nbr].size());
+                    for (uint32_t nn : graph_[nbr]) {
+                        float d = compute_l2sq(get_vector(nbr), get_vector(nn), dim_);
+                        nbr_candidates.push_back({d, nn});
+                    }
+                    robust_prune(nbr, nbr_candidates, pass_alpha, R);
+                }
+            }
+
+            // Progress reporting
+            if (idx % 10000 == 0) {
+                #pragma omp critical
+                {
+                    std::cout << "\r    Inserted " << idx << " / " << npts_
+                              << " points" << std::flush;
+                }
             }
         }
+        std::cout << "\r    Inserted " << npts_ << " / " << npts_ << " points" << std::endl;
     }
 
     double build_time = build_timer.elapsed_seconds();
